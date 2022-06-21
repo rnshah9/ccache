@@ -1,6 +1,6 @@
-project: rnshah9/ccache
+project: ccache
 target: ccache
 
 cmds:
-  - cmd: /repo/build/ccache --checksum-file @@
+  - cmd: /repo/build/ccache --checksum-file /test.c
     filepath: /test.c

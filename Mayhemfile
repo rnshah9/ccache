@@ -2,5 +2,4 @@ project: ccache
 target: ccache
 
 cmds:
-  - cmd: /repo/build/ccache --checksum-file /test.c
-    filepath: /test.c
+  - cmd: /install/bin/ccache --checksum-file @@

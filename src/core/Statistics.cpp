@@ -25,6 +25,8 @@
 #include <util/TextTable.hpp>
 #include <util/string.hpp>
 
+#include <algorithm>
+
 namespace core {
 
 using core::Statistic;
@@ -122,8 +124,7 @@ const StatisticsField k_statistics_fields[] = {
 };
 
 static_assert(sizeof(k_statistics_fields) / sizeof(k_statistics_fields[0])
-                == static_cast<size_t>(Statistic::END) - 1,
-              "incorrect number of fields");
+              == static_cast<size_t>(Statistic::END) - 1);
 
 static std::string
 format_timestamp(const uint64_t value)
@@ -269,11 +270,8 @@ Statistics::format_human_readable(const Config& config,
     if (verbosity > 0) {
       auto uncacheable_stats = get_stats(FLAG_UNCACHEABLE, verbosity > 1);
       std::sort(uncacheable_stats.begin(), uncacheable_stats.end(), cmp_fn);
-      for (const auto& descr_count : uncacheable_stats) {
-        add_ratio_row(table,
-                      FMT("  {}:", descr_count.first),
-                      descr_count.second,
-                      uncacheable);
+      for (const auto& [name, value] : uncacheable_stats) {
+        add_ratio_row(table, FMT("  {}:", name), value, uncacheable);
       }
     }
   }
@@ -283,9 +281,8 @@ Statistics::format_human_readable(const Config& config,
     if (verbosity > 0) {
       auto error_stats = get_stats(FLAG_ERROR, verbosity > 1);
       std::sort(error_stats.begin(), error_stats.end(), cmp_fn);
-      for (const auto& descr_count : error_stats) {
-        add_ratio_row(
-          table, FMT("  {}:", descr_count.first), descr_count.second, errors);
+      for (const auto& [name, value] : error_stats) {
+        add_ratio_row(table, FMT("  {}:", name), value, errors);
       }
     }
   }
@@ -304,25 +301,31 @@ Statistics::format_human_readable(const Config& config,
   table.add_heading("Primary storage:");
   add_ratio_row(table, "  Hits:", pri_hits, pri_hits + pri_misses);
   add_ratio_row(table, "  Misses:", pri_misses, pri_hits + pri_misses);
+
   if (!from_log) {
-    table.add_row({
+    std::vector<C> size_cells{
       "  Cache size (GB):",
-      C(FMT("{:.2f}", static_cast<double>(pri_size) / g)).right_align(),
-      "/",
-      C(FMT("{:.2f}", static_cast<double>(config.max_size()) / g))
-        .right_align(),
-      percent(pri_size, config.max_size()),
-    });
-    if (verbosity > 0) {
-      std::vector<C> cells{"  Files:", S(files_in_cache)};
-      if (config.max_files() > 0) {
-        cells.emplace_back("/");
-        cells.emplace_back(config.max_files());
-        cells.emplace_back(percent(S(files_in_cache), config.max_files()));
-      }
-      table.add_row(cells);
+      C(FMT("{:.2f}", static_cast<double>(pri_size) / g)).right_align()};
+    if (config.max_size() != 0) {
+      size_cells.emplace_back("/");
+      size_cells.emplace_back(
+        C(FMT("{:.2f}", static_cast<double>(config.max_size()) / g))
+          .right_align());
+      size_cells.emplace_back(percent(pri_size, config.max_size()));
     }
-    if (cleanups > 0) {
+    table.add_row(size_cells);
+
+    if (verbosity > 0) {
+      std::vector<C> files_cells{"  Files:", S(files_in_cache)};
+      if (config.max_files() > 0) {
+        files_cells.emplace_back("/");
+        files_cells.emplace_back(config.max_files());
+        files_cells.emplace_back(
+          percent(S(files_in_cache), config.max_files()));
+      }
+      table.add_row(files_cells);
+    }
+    if (cleanups > 0 || verbosity > 1) {
       table.add_row({"  Cleanups:", cleanups});
     }
   }

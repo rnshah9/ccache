@@ -27,7 +27,6 @@
 #include "File.hpp"
 #include "Finalizer.hpp"
 #include "Hash.hpp"
-#include "Lockfile.hpp"
 #include "Logging.hpp"
 #include "MiniTrace.hpp"
 #include "Result.hpp"
@@ -69,6 +68,9 @@
 #include <optional>
 #include <string_view>
 
+#ifdef HAVE_SYS_TIME_H
+#  include <sys/time.h>
+#endif
 #ifdef HAVE_UNISTD_H
 #  include <unistd.h>
 #endif
@@ -77,11 +79,6 @@
 #include <cmath>
 #include <limits>
 #include <memory>
-
-#ifndef MYNAME
-#  define MYNAME "ccache"
-#endif
-const char CCACHE_NAME[] = MYNAME;
 
 using core::Statistic;
 
@@ -151,7 +148,7 @@ add_prefix(const Context& ctx, Args& args, const std::string& prefix_command)
 
   Args prefix;
   for (const auto& word : Util::split_into_strings(prefix_command, " ")) {
-    std::string path = find_executable(ctx, word, CCACHE_NAME);
+    std::string path = find_executable(ctx, word, ctx.orig_args[0]);
     if (path.empty()) {
       throw core::Fatal("{}: {}", word, strerror(errno));
     }
@@ -167,6 +164,7 @@ add_prefix(const Context& ctx, Args& args, const std::string& prefix_command)
 
 static std::string
 prepare_debug_path(const std::string& debug_dir,
+                   const timeval& time_of_invocation,
                    const std::string& output_obj,
                    std::string_view suffix)
 {
@@ -177,7 +175,22 @@ prepare_debug_path(const std::string& debug_dir,
     // Ignore since we can't handle an error in another way in this context. The
     // caller takes care of logging when trying to open the path for writing.
   }
-  return FMT("{}.ccache-{}", prefix, suffix);
+
+  char timestamp[100];
+  const auto tm = Util::localtime(time_of_invocation.tv_sec);
+  if (tm) {
+    strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &*tm);
+  } else {
+    snprintf(timestamp,
+             sizeof(timestamp),
+             "%llu",
+             static_cast<long long unsigned int>(time_of_invocation.tv_sec));
+  }
+  return FMT("{}.{}_{:06}.ccache-{}",
+             prefix,
+             timestamp,
+             time_of_invocation.tv_usec,
+             suffix);
 }
 
 static void
@@ -191,8 +204,10 @@ init_hash_debug(Context& ctx,
     return;
   }
 
-  const auto path = prepare_debug_path(
-    ctx.config.debug_dir(), ctx.args_info.output_obj, FMT("input-{}", type));
+  const auto path = prepare_debug_path(ctx.config.debug_dir(),
+                                       ctx.time_of_invocation,
+                                       ctx.args_info.output_obj,
+                                       FMT("input-{}", type));
   File debug_binary_file(path, "wb");
   if (debug_binary_file) {
     hash.enable_debug(section_name, debug_binary_file.get(), debug_text_file);
@@ -235,6 +250,8 @@ guess_compiler(std::string_view path)
     return CompilerType::gcc;
   } else if (name.find("nvcc") != std::string_view::npos) {
     return CompilerType::nvcc;
+  } else if (name == "icl") {
+    return CompilerType::icl;
   } else if (name == "cl") {
     return CompilerType::msvc;
   } else {
@@ -352,7 +369,7 @@ do_remember_include_file(Context& ctx,
   }
 
   // Let's hash the include file content.
-  Hash fhash;
+  Digest file_digest;
 
   if (is_pch) {
     if (ctx.args_info.included_pch_file.empty()) {
@@ -370,28 +387,27 @@ do_remember_include_file(Context& ctx,
       }
     }
 
-    if (!hash_binary_file(ctx, fhash, path)) {
+    if (!hash_binary_file(ctx, file_digest, path)) {
       return false;
     }
     cpp_hash.hash_delimiter(using_pch_sum ? "pch_sum_hash" : "pch_hash");
-    cpp_hash.hash(fhash.digest().to_string());
+    cpp_hash.hash(file_digest.to_string());
   }
 
   if (ctx.config.direct_mode()) {
     if (!is_pch) { // else: the file has already been hashed.
-      int result = hash_source_code_file(ctx, fhash, path);
+      int result = hash_source_code_file(ctx, file_digest, path);
       if (result & HASH_SOURCE_CODE_ERROR
           || result & HASH_SOURCE_CODE_FOUND_TIME) {
         return false;
       }
     }
 
-    Digest d = fhash.digest();
-    ctx.included_files.emplace(path, d);
+    ctx.included_files.emplace(path, file_digest);
 
     if (depend_mode_hash) {
       depend_mode_hash->hash_delimiter("include");
-      depend_mode_hash->hash(d.to_string());
+      depend_mode_hash->hash(file_digest.to_string());
     }
   }
 
@@ -425,8 +441,8 @@ remember_include_file(Context& ctx,
 static void
 print_included_files(const Context& ctx, FILE* fp)
 {
-  for (const auto& item : ctx.included_files) {
-    PRINT(fp, "{}\n", item.first);
+  for (const auto& [path, digest] : ctx.included_files) {
+    PRINT(fp, "{}\n", path);
   }
 }
 
@@ -462,8 +478,7 @@ process_preprocessed_file(Context& ctx, Hash& hash, const std::string& path)
       "# 32 \"<command-line>\" 2\n";
     // Note: Intentionally not using the string form to avoid false positive
     // match by ccache itself.
-    static const char incbin_prefix[] = {
-      '.', 'i', 'n', 'c', 'b', 'i', 'n', ' '};
+    static const char incbin_directive[] = {'.', 'i', 'n', 'c', 'b', 'i', 'n'};
 
     // Check if we look at a line containing the file name of an included file.
     // At least the following formats exist (where N is a positive integer):
@@ -551,9 +566,6 @@ process_preprocessed_file(Context& ctx, Hash& hash, const std::string& path)
       }
       // p and q span the include file path.
       std::string inc_path(p, q - p);
-      if (!ctx.has_absolute_include_headers) {
-        ctx.has_absolute_include_headers = util::is_absolute_path(inc_path);
-      }
       inc_path = Util::normalize_concrete_absolute_path(inc_path);
       inc_path = Util::make_relative_path(ctx, inc_path);
 
@@ -567,14 +579,16 @@ process_preprocessed_file(Context& ctx, Hash& hash, const std::string& path)
           Statistic::could_not_use_precompiled_header);
       }
       p = q; // Everything of interest between p and q has been hashed now.
-    } else if (strncmp(q, incbin_prefix, sizeof(incbin_prefix)) == 0
-               && (q[8] == '"' || (q[8] == '\\' && q[9] == '"'))) {
+    } else if (strncmp(q, incbin_directive, sizeof(incbin_directive)) == 0
+               && ((q[7] == ' '
+                    && (q[8] == '"' || (q[8] == '\\' && q[9] == '"')))
+                   || q[7] == '"')) {
       // An assembler .inc bin (without the space) statement, which could be
       // part of inline assembly, refers to an external file. If the file
       // changes, the hash should change as well, but finding out what file to
       // hash is too hard for ccache, so just bail out.
       LOG_RAW(
-        "Found unsupported .inc"
+        "Found potential unsupported .inc"
         "bin directive in source code");
       return nonstd::make_unexpected(
         Failure(Statistic::unsupported_code_directive));
@@ -635,9 +649,6 @@ result_key_from_depfile(Context& ctx, Hash& hash)
     if (util::ends_with(token, ":")) {
       continue;
     }
-    if (!ctx.has_absolute_include_headers) {
-      ctx.has_absolute_include_headers = util::is_absolute_path(token);
-    }
     std::string path = Util::make_relative_path(ctx, token);
     remember_include_file(ctx, path, hash, false, &hash);
   }
@@ -658,13 +669,40 @@ result_key_from_depfile(Context& ctx, Hash& hash)
 
   return hash.digest();
 }
+
+struct GetTmpFdResult
+{
+  Fd fd;
+  std::string path;
+};
+
+static GetTmpFdResult
+get_tmp_fd(Context& ctx,
+           const std::string_view description,
+           const bool capture_output)
+{
+  if (capture_output) {
+    TemporaryFile tmp_stdout(
+      FMT("{}/tmp.{}", ctx.config.temporary_dir(), description));
+    ctx.register_pending_tmp_file(tmp_stdout.path);
+    return {std::move(tmp_stdout.fd), std::move(tmp_stdout.path)};
+  } else {
+    const auto dev_null_path = util::get_dev_null_path();
+    return {Fd(open(dev_null_path, O_WRONLY | O_BINARY)), dev_null_path};
+  }
+}
+
+struct DoExecuteResult
+{
+  int exit_status;
+  std::string stdout_data;
+  std::string stderr_data;
+};
+
 // Execute the compiler/preprocessor, with logic to retry without requesting
 // colored diagnostics messages if that fails.
-static nonstd::expected<int, Failure>
-do_execute(Context& ctx,
-           Args& args,
-           TemporaryFile&& tmp_stdout,
-           TemporaryFile&& tmp_stderr)
+static nonstd::expected<DoExecuteResult, Failure>
+do_execute(Context& ctx, Args& args, const bool capture_stdout = true)
 {
   UmaskScope umask_scope(ctx.original_umask);
 
@@ -672,6 +710,10 @@ do_execute(Context& ctx,
     DEBUG_ASSERT(ctx.config.compiler_type() == CompilerType::gcc);
     args.erase_last("-fdiagnostics-color");
   }
+
+  auto tmp_stdout = get_tmp_fd(ctx, "stdout", capture_stdout);
+  auto tmp_stderr = get_tmp_fd(ctx, "stderr", true);
+
   int status = execute(ctx,
                        args.to_argv().data(),
                        std::move(tmp_stdout.fd),
@@ -690,26 +732,22 @@ do_execute(Context& ctx,
       // error message.)
       LOG_RAW("-fdiagnostics-color is unsupported; trying again without it");
 
-      tmp_stdout.fd = Fd(open(
-        tmp_stdout.path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_BINARY, 0600));
-      if (!tmp_stdout.fd) {
-        LOG("Failed to truncate {}: {}", tmp_stdout.path, strerror(errno));
-        return nonstd::make_unexpected(Statistic::internal_error);
-      }
-
-      tmp_stderr.fd = Fd(open(
-        tmp_stderr.path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_BINARY, 0600));
-      if (!tmp_stderr.fd) {
-        LOG("Failed to truncate {}: {}", tmp_stderr.path, strerror(errno));
-        return nonstd::make_unexpected(Statistic::internal_error);
-      }
-
       ctx.diagnostics_color_failed = true;
-      return do_execute(
-        ctx, args, std::move(tmp_stdout), std::move(tmp_stderr));
+      return do_execute(ctx, args, capture_stdout);
     }
   }
-  return status;
+
+  try {
+    return DoExecuteResult{
+      status,
+      capture_stdout ? Util::read_file(tmp_stdout.path) : std::string(),
+      Util::read_file(tmp_stderr.path),
+    };
+  } catch (core::Error&) {
+    // The stdout or stderr file was removed - cleanup in progress? Better bail
+    // out.
+    return nonstd::make_unexpected(Statistic::missing_cache_file);
+  }
 }
 
 static core::Manifest
@@ -959,13 +997,6 @@ to_cache(Context& ctx,
     args.push_back(ctx.args_info.output_dia);
   }
 
-  // Turn off DEPENDENCIES_OUTPUT when running cc1, because otherwise it will
-  // emit a line like this:
-  //
-  //   tmp.stdout.vexed.732.o: /home/mbp/.ccache/tmp.stdout.vexed.732.i
-  Util::unsetenv("DEPENDENCIES_OUTPUT");
-  Util::unsetenv("SUNPRO_DEPENDENCIES");
-
   if (ctx.config.run_second_cpp()) {
     args.push_back(ctx.args_info.input_file);
   } else {
@@ -987,18 +1018,9 @@ to_cache(Context& ctx,
   LOG_RAW("Running real compiler");
   MTR_BEGIN("execute", "compiler");
 
-  TemporaryFile tmp_stdout(FMT("{}/tmp.stdout", ctx.config.temporary_dir()));
-  ctx.register_pending_tmp_file(tmp_stdout.path);
-  std::string tmp_stdout_path = tmp_stdout.path;
-
-  TemporaryFile tmp_stderr(FMT("{}/tmp.stderr", ctx.config.temporary_dir()));
-  ctx.register_pending_tmp_file(tmp_stderr.path);
-  std::string tmp_stderr_path = tmp_stderr.path;
-
-  nonstd::expected<int, Failure> status;
+  nonstd::expected<DoExecuteResult, Failure> result;
   if (!ctx.config.depend_mode()) {
-    status =
-      do_execute(ctx, args, std::move(tmp_stdout), std::move(tmp_stderr));
+    result = do_execute(ctx, args);
     args.pop_back(3);
   } else {
     // Use the original arguments (including dependency options) in depend
@@ -1009,45 +1031,32 @@ to_cache(Context& ctx,
     add_prefix(ctx, depend_mode_args, ctx.config.prefix_command());
 
     ctx.time_of_compilation = time(nullptr);
-    status = do_execute(
-      ctx, depend_mode_args, std::move(tmp_stdout), std::move(tmp_stderr));
+    result = do_execute(ctx, depend_mode_args);
   }
   MTR_END("execute", "compiler");
 
-  if (!status) {
-    return nonstd::make_unexpected(status.error());
+  if (!result) {
+    return nonstd::make_unexpected(result.error());
   }
 
-  // Merge stderr from the preprocessor (if any) and stderr from
-  // the real compiler into tmp_stderr.
-  if (!ctx.cpp_stderr.empty()) {
-    std::string combined_stderr =
-      Util::read_file(ctx.cpp_stderr) + Util::read_file(tmp_stderr_path);
-    Util::write_file(tmp_stderr_path, combined_stderr);
+  // Merge stderr from the preprocessor (if any) and stderr from the real
+  // compiler.
+  if (!ctx.cpp_stderr_data.empty()) {
+    result->stderr_data = ctx.cpp_stderr_data + result->stderr_data;
   }
 
-  std::string stdout_data;
-  std::string stderr_data;
-  try {
-    stdout_data = Util::read_file(tmp_stdout_path);
-    stderr_data = Util::read_file(tmp_stderr_path);
-  } catch (core::Error&) {
-    // The stdout or stderr file was removed - cleanup in progress? Better bail
-    // out.
-    return nonstd::make_unexpected(Statistic::missing_cache_file);
-  }
+  result->stdout_data =
+    rewrite_stdout_from_compiler(ctx, std::move(result->stdout_data));
 
-  stdout_data = rewrite_stdout_from_compiler(ctx, std::move(stdout_data));
-
-  if (status != 0) {
-    LOG("Compiler gave exit status {}", *status);
+  if (result->exit_status != 0) {
+    LOG("Compiler gave exit status {}", result->exit_status);
 
     // We can output stderr immediately instead of rerunning the compiler.
-    Util::send_to_fd(ctx, stderr_data, STDERR_FILENO);
-    Util::send_to_fd(ctx, stdout_data, STDOUT_FILENO);
+    Util::send_to_fd(ctx, result->stderr_data, STDERR_FILENO);
+    Util::send_to_fd(ctx, result->stdout_data, STDOUT_FILENO);
 
     auto failure = Failure(Statistic::compile_failed);
-    failure.set_exit_code(*status);
+    failure.set_exit_code(result->exit_status);
     return nonstd::make_unexpected(failure);
   }
 
@@ -1087,7 +1096,8 @@ to_cache(Context& ctx,
   MTR_BEGIN("result", "result_put");
   const bool added = ctx.storage.put(
     *result_key, core::CacheEntryType::result, [&](const auto& path) {
-      return write_result(ctx, path, obj_stat, stdout_data, stderr_data);
+      return write_result(
+        ctx, path, obj_stat, result->stdout_data, result->stderr_data);
     });
   MTR_END("result", "result_put");
   if (!added) {
@@ -1095,9 +1105,9 @@ to_cache(Context& ctx,
   }
 
   // Everything OK.
-  Util::send_to_fd(ctx, stderr_data, STDERR_FILENO);
+  Util::send_to_fd(ctx, result->stderr_data, STDERR_FILENO);
   // Send stdout after stderr, it makes the output clearer with MSVC.
-  Util::send_to_fd(ctx, stdout_data, STDOUT_FILENO);
+  Util::send_to_fd(ctx, result->stdout_data, STDOUT_FILENO);
 
   return *result_key;
 }
@@ -1109,78 +1119,69 @@ get_result_key_from_cpp(Context& ctx, Args& args, Hash& hash)
 {
   ctx.time_of_compilation = time(nullptr);
 
-  std::string stderr_path;
-  std::string stdout_path;
+  std::string preprocessed_path;
+  std::string cpp_stderr_data;
+
   if (ctx.args_info.direct_i_file) {
     // We are compiling a .i or .ii file - that means we can skip the cpp stage
     // and directly form the correct i_tmpfile.
-    stdout_path = ctx.args_info.input_file;
+    preprocessed_path = ctx.args_info.input_file;
+    cpp_stderr_data = "";
   } else {
     // Run cpp on the input file to obtain the .i.
 
+    // preprocessed_path needs the proper cpp_extension for the compiler to do
+    // its thing correctly.
     TemporaryFile tmp_stdout(
-      FMT("{}/tmp.cpp_stdout", ctx.config.temporary_dir()));
-    ctx.register_pending_tmp_file(tmp_stdout.path);
+      FMT("{}/tmp.cpp_stdout", ctx.config.temporary_dir()),
+      FMT(".{}", ctx.config.cpp_extension()));
+    preprocessed_path = tmp_stdout.path;
+    tmp_stdout.fd.close(); // We're only using the path.
+    ctx.register_pending_tmp_file(preprocessed_path);
 
-    // stdout_path needs the proper cpp_extension for the compiler to do its
-    // thing correctly.
-    stdout_path = FMT("{}.{}", tmp_stdout.path, ctx.config.cpp_extension());
-    Util::hard_link_or_copy(tmp_stdout.path, stdout_path);
-    ctx.register_pending_tmp_file(stdout_path);
-
-    TemporaryFile tmp_stderr(
-      FMT("{}/tmp.cpp_stderr", ctx.config.temporary_dir()));
-    stderr_path = tmp_stderr.path;
-    ctx.register_pending_tmp_file(stderr_path);
-
-    size_t args_added = 2;
+    const size_t orig_args_size = args.size();
     args.push_back("-E");
-    if (ctx.args_info.actual_language == "hip") {
-      args.push_back("-o");
-      args.push_back("-");
-      args_added += 2;
-    }
     if (ctx.config.keep_comments_cpp()) {
       args.push_back("-C");
-      args_added++;
     }
+
+    // Pass -o instead of sending the preprocessor output to stdout to work
+    // around compilers that don't exit with a proper status on write error to
+    // stdout. See also <https://github.com/llvm/llvm-project/issues/56499>.
+    args.push_back("-o");
+    args.push_back(preprocessed_path);
+
     args.push_back(ctx.args_info.input_file);
+
     add_prefix(ctx, args, ctx.config.prefix_command_cpp());
     LOG_RAW("Running preprocessor");
     MTR_BEGIN("execute", "preprocessor");
-    const auto status =
-      do_execute(ctx, args, std::move(tmp_stdout), std::move(tmp_stderr));
+    const auto result = do_execute(ctx, args, false);
     MTR_END("execute", "preprocessor");
-    args.pop_back(args_added);
+    args.pop_back(args.size() - orig_args_size);
 
-    if (!status) {
-      return nonstd::make_unexpected(status.error());
-    } else if (*status != 0) {
-      LOG("Preprocessor gave exit status {}", *status);
+    if (!result) {
+      return nonstd::make_unexpected(result.error());
+    } else if (result->exit_status != 0) {
+      LOG("Preprocessor gave exit status {}", result->exit_status);
       return nonstd::make_unexpected(Statistic::preprocessor_error);
     }
+
+    cpp_stderr_data = result->stderr_data;
   }
 
   hash.hash_delimiter("cpp");
-  TRY(process_preprocessed_file(ctx, hash, stdout_path));
+  TRY(process_preprocessed_file(ctx, hash, preprocessed_path));
 
   hash.hash_delimiter("cppstderr");
-  if (!ctx.args_info.direct_i_file && !hash.hash_file(stderr_path)) {
-    // Somebody removed the temporary file?
-    LOG("Failed to open {}: {}", stderr_path, strerror(errno));
-    return nonstd::make_unexpected(Statistic::internal_error);
-  }
+  hash.hash(cpp_stderr_data);
 
-  if (ctx.args_info.direct_i_file) {
-    ctx.i_tmpfile = ctx.args_info.input_file;
-  } else {
-    ctx.i_tmpfile = stdout_path;
-  }
+  ctx.i_tmpfile = preprocessed_path;
 
   if (!ctx.config.run_second_cpp()) {
     // If we are using the CPP trick, we need to remember this stderr data and
     // output it just before the main stderr from the compiler pass.
-    ctx.cpp_stderr = stderr_path;
+    ctx.cpp_stderr_data = std::move(cpp_stderr_data);
     hash.hash_delimiter("runsecondcpp");
     hash.hash("false");
   }
@@ -1259,7 +1260,7 @@ hash_nvcc_host_compiler(const Context& ctx,
           TRY(hash_compiler(ctx, hash, st, path, false));
         }
       } else {
-        std::string path = find_executable(ctx, compiler, CCACHE_NAME);
+        std::string path = find_executable(ctx, compiler, ctx.orig_args[0]);
         if (!path.empty()) {
           auto st = Stat::stat(path, Stat::OnError::log);
           TRY(hash_compiler(ctx, hash, st, ccbin, false));
@@ -1271,12 +1272,6 @@ hash_nvcc_host_compiler(const Context& ctx,
   }
 
   return {};
-}
-
-static bool
-should_rewrite_dependency_target(const ArgsInfo& args_info)
-{
-  return !args_info.dependency_target_specified && args_info.seen_MD_MMD;
 }
 
 // update a hash with information common for the direct and preprocessor modes.
@@ -1369,7 +1364,7 @@ hash_common_info(const Context& ctx,
     hash.hash(dir_to_hash);
   }
 
-  // The object file produced by MSVC includes the full path to the object file
+  // The object file produced by MSVC includes the full path to the source file
   // even without debug flags. Hashing the directory should be enough since the
   // filename is included in the hash anyway.
   if (ctx.config.is_compiler_group_msvc() && ctx.config.hash_dir()) {
@@ -1382,12 +1377,7 @@ hash_common_info(const Context& ctx,
     hash.hash(output_obj_dir);
   }
 
-  if ((!should_rewrite_dependency_target(ctx.args_info)
-       && ctx.args_info.generating_dependencies)
-      || ctx.args_info.seen_split_dwarf || ctx.args_info.profile_arcs) {
-    // If generating dependencies: The output object file name is part of the .d
-    // file, so include the path in the hash.
-    //
+  if (ctx.args_info.seen_split_dwarf || ctx.args_info.profile_arcs) {
     // When using -gsplit-dwarf: Object files include a link to the
     // corresponding .dwo file based on the target object filename, so hashing
     // the object file path will do it, although just hashing the object file
@@ -1429,7 +1419,7 @@ hash_common_info(const Context& ctx,
   // Possibly hash the sanitize blacklist file path.
   for (const auto& sanitize_blacklist : args_info.sanitize_blacklists) {
     LOG("Hashing sanitize blacklist {}", sanitize_blacklist);
-    hash.hash("sanitizeblacklist");
+    hash.hash_delimiter("sanitizeblacklist");
     if (!hash_binary_file(ctx, hash, sanitize_blacklist)) {
       return nonstd::make_unexpected(Statistic::error_hashing_extra_file);
     }
@@ -1507,6 +1497,24 @@ option_should_be_ignored(const std::string& arg,
         pattern == arg
         || (util::ends_with(pattern, "*") && util::starts_with(arg, prefix)));
     });
+}
+
+static std::tuple<std::optional<std::string_view>,
+                  std::optional<std::string_view>>
+get_option_and_value(std::string_view option, const Args& args, size_t& i)
+{
+  if (args[i] == option) {
+    if (i + 1 < args.size()) {
+      ++i;
+      return {option, args[i]};
+    } else {
+      return {std::nullopt, std::nullopt};
+    }
+  } else if (util::starts_with(args[i], option)) {
+    return {option, std::string_view(args[i]).substr(option.length())};
+  } else {
+    return {std::nullopt, std::nullopt};
+  }
 }
 
 // Update a hash sum with information specific to the direct and preprocessor
@@ -1598,10 +1606,12 @@ calculate_result_and_manifest_key(Context& ctx,
       }
     }
 
-    // If we're generating dependencies, we make sure to skip the filename of
-    // the dependency file, since it doesn't impact the output.
     if (ctx.args_info.generating_dependencies) {
+      std::optional<std::string_view> option;
+      std::optional<std::string_view> value;
+
       if (util::starts_with(args[i], "-Wp,")) {
+        // Skip the dependency filename since it doesn't impact the output.
         if (util::starts_with(args[i], "-Wp,-MD,")
             && args[i].find(',', 8) == std::string::npos) {
           hash.hash(args[i].data(), 8);
@@ -1611,18 +1621,22 @@ calculate_result_and_manifest_key(Context& ctx,
           hash.hash(args[i].data(), 9);
           continue;
         }
-      } else if (util::starts_with(args[i], "-MF")) {
-        // In either case, hash the "-MF" part.
-        hash.hash_delimiter("arg");
-        hash.hash(args[i].data(), 3);
-
-        if (ctx.args_info.output_dep != "/dev/null") {
-          bool separate_argument = (args[i].size() == 3);
-          if (separate_argument) {
-            // Next argument is dependency name, so skip it.
-            i++;
-          }
-        }
+      } else if (std::tie(option, value) = get_option_and_value("-MF", args, i);
+                 option) {
+        // Skip the dependency filename since it doesn't impact the output.
+        hash.hash(*option);
+        continue;
+      } else if (std::tie(option, value) = get_option_and_value("-MQ", args, i);
+                 option) {
+        hash.hash(*option);
+        // No need to hash the dependency target since we always calculate it on
+        // a cache hit.
+        continue;
+      } else if (std::tie(option, value) = get_option_and_value("-MT", args, i);
+                 option) {
+        hash.hash(*option);
+        // No need to hash the dependency target since we always calculate it on
+        // a cache hit.
         continue;
       }
     }
@@ -1778,8 +1792,10 @@ calculate_result_and_manifest_key(Context& ctx,
     hash.hash_delimiter("inputfile");
     hash.hash(ctx.args_info.input_file);
 
-    hash.hash_delimiter("sourcecode");
-    int result = hash_source_code_file(ctx, hash, ctx.args_info.input_file);
+    hash.hash_delimiter("sourcecode hash");
+    Digest input_file_digest;
+    int result =
+      hash_source_code_file(ctx, input_file_digest, ctx.args_info.input_file);
     if (result & HASH_SOURCE_CODE_ERROR) {
       return nonstd::make_unexpected(Statistic::internal_error);
     }
@@ -1788,11 +1804,13 @@ calculate_result_and_manifest_key(Context& ctx,
       ctx.config.set_direct_mode(false);
       return std::make_pair(std::nullopt, std::nullopt);
     }
+    hash.hash(input_file_digest.to_string());
 
     manifest_key = hash.digest();
 
-    const auto manifest_path =
-      ctx.storage.get(*manifest_key, core::CacheEntryType::manifest);
+    auto manifest_path = ctx.storage.get(*manifest_key,
+                                         core::CacheEntryType::manifest,
+                                         storage::Storage::Mode::primary_only);
 
     if (manifest_path) {
       LOG("Looking for result key in {}", *manifest_path);
@@ -1808,6 +1826,30 @@ calculate_result_and_manifest_key(Context& ctx,
         LOG_RAW("Got result key from manifest");
       } else {
         LOG_RAW("Did not find result key in manifest");
+      }
+    }
+    // Check secondary storage if not found in primary
+    if (!result_key) {
+      manifest_path = ctx.storage.get(*manifest_key,
+                                      core::CacheEntryType::manifest,
+                                      storage::Storage::Mode::secondary_only);
+      if (manifest_path) {
+        LOG("Looking for result key in fetched secondary manifest {}",
+            *manifest_path);
+        MTR_BEGIN("manifest", "secondary_manifest_get");
+        try {
+          const auto manifest = read_manifest(*manifest_path);
+          result_key = manifest.look_up_result_digest(ctx);
+        } catch (const core::Error& e) {
+          LOG(
+            "Failed to look up result key in {}: {}", *manifest_path, e.what());
+        }
+        MTR_END("manifest", "secondary_manifest_get");
+        if (result_key) {
+          LOG_RAW("Got result key from fetched secondary manifest");
+        } else {
+          LOG_RAW("Did not find result key in fetched secondary manifest");
+        }
       }
     }
   } else if (ctx.args_info.arch_args.empty()) {
@@ -1842,7 +1884,7 @@ calculate_result_and_manifest_key(Context& ctx,
 enum class FromCacheCallMode { direct, cpp };
 
 // Try to return the compile result from cache.
-static bool
+static nonstd::expected<bool, Failure>
 from_cache(Context& ctx, FromCacheCallMode mode, const Digest& result_key)
 {
   UmaskScope umask_scope(ctx.original_umask);
@@ -1881,10 +1923,13 @@ from_cache(Context& ctx, FromCacheCallMode mode, const Digest& result_key)
     core::FileReader file_reader(file.get());
     core::CacheEntryReader cache_entry_reader(file_reader);
     Result::Reader result_reader(cache_entry_reader, *result_path);
-    ResultRetriever result_retriever(
-      ctx, should_rewrite_dependency_target(ctx.args_info));
+    ResultRetriever result_retriever(ctx);
 
     result_reader.read(result_retriever);
+  } catch (ResultRetriever::WriteError& e) {
+    LOG(
+      "Write error when retrieving result from {}: {}", *result_path, e.what());
+    return nonstd::make_unexpected(Statistic::bad_output_file);
   } catch (core::Error& e) {
     LOG("Failed to get result from {}: {}", *result_path, e.what());
     return false;
@@ -1895,8 +1940,7 @@ from_cache(Context& ctx, FromCacheCallMode mode, const Digest& result_key)
 }
 
 // Find the real compiler and put it into ctx.orig_args[0]. We just search the
-// PATH to find an executable of the same name that isn't a link to ourselves.
-// Pass find_executable function as second parameter.
+// PATH to find an executable of the same name that isn't ourselves.
 void
 find_compiler(Context& ctx,
               const FindExecutableFunction& find_executable_function)
@@ -1906,8 +1950,7 @@ find_compiler(Context& ctx,
   // ccache ccache gcc --> 2
   size_t compiler_pos = 0;
   while (compiler_pos < ctx.orig_args.size()
-         && Util::same_program_name(
-           Util::base_name(ctx.orig_args[compiler_pos]), CCACHE_NAME)) {
+         && Util::is_ccache_executable(ctx.orig_args[compiler_pos])) {
     ++compiler_pos;
   }
 
@@ -1923,17 +1966,14 @@ find_compiler(Context& ctx,
   const std::string resolved_compiler =
     util::is_full_path(compiler)
       ? compiler
-      : find_executable_function(ctx, compiler, CCACHE_NAME);
+      : find_executable_function(ctx, compiler, ctx.orig_args[0]);
 
   if (resolved_compiler.empty()) {
     throw core::Fatal("Could not find compiler \"{}\" in PATH", compiler);
   }
 
-  if (Util::same_program_name(Util::base_name(resolved_compiler),
-                              CCACHE_NAME)) {
-    throw core::Fatal(
-      "Recursive invocation (the name of the ccache binary must be \"{}\")",
-      CCACHE_NAME);
+  if (Util::is_ccache_executable(resolved_compiler)) {
+    throw core::Fatal("Recursive invocation of ccache");
   }
 
   ctx.orig_args.pop_front(compiler_pos);
@@ -1949,6 +1989,9 @@ initialize(Context& ctx, int argc, const char* const* argv)
 
   LOG("=== CCACHE {} STARTED =========================================",
       CCACHE_VERSION);
+
+  LOG("Primary configuration file: {}", ctx.config.primary_config_path());
+  LOG("Secondary configuration file: {}", ctx.config.secondary_config_path());
 
   if (getenv("CCACHE_INTERNAL_TRACE")) {
 #ifdef MTR_ENABLED
@@ -2031,8 +2074,10 @@ finalize_at_exit(Context& ctx)
 
   // Dump log buffer last to not lose any logs.
   if (ctx.config.debug() && !ctx.args_info.output_obj.empty()) {
-    Logging::dump_log(prepare_debug_path(
-      ctx.config.debug_dir(), ctx.args_info.output_obj, "log"));
+    Logging::dump_log(prepare_debug_path(ctx.config.debug_dir(),
+                                         ctx.time_of_invocation,
+                                         ctx.args_info.output_obj,
+                                         "log"));
   }
 }
 
@@ -2089,7 +2134,7 @@ cache_compilation(int argc, const char* const* argv)
 
   if (fall_back_to_original_compiler) {
     if (original_umask) {
-      umask(*original_umask);
+      Util::set_umask(*original_umask);
     }
     auto execv_argv = saved_orig_args.to_argv();
     execute_noreturn(execv_argv.data(), saved_temp_dir);
@@ -2142,6 +2187,12 @@ do_cache_compilation(Context& ctx, const char* const* argv)
 
   LOG("Compiler type: {}", compiler_type_to_string(ctx.config.compiler_type()));
 
+  // Set CCACHE_DISABLE so no process ccache executes from now on will risk
+  // calling ccache second time. For instance, if the real compiler is a wrapper
+  // script that calls "ccache $compiler ..." we want that inner ccache call to
+  // be disabled.
+  Util::setenv("CCACHE_DISABLE", "1");
+
   MTR_BEGIN("main", "process_args");
   ProcessArgsResult processed = process_args(ctx);
   MTR_END("main", "process_args");
@@ -2151,6 +2202,13 @@ do_cache_compilation(Context& ctx, const char* const* argv)
   }
 
   TRY(set_up_uncached_err());
+
+  for (const auto& name : {"DEPENDENCIES_OUTPUT", "SUNPRO_DEPENDENCIES"}) {
+    if (getenv(name)) {
+      LOG("Unsupported environment variable: {}", name);
+      return Statistic::unsupported_environment_variable;
+    }
+  }
 
   if (ctx.config.is_compiler_group_msvc()) {
     for (const auto& name : {"CL", "_CL_"}) {
@@ -2206,8 +2264,10 @@ do_cache_compilation(Context& ctx, const char* const* argv)
   MTR_META_THREAD_NAME(ctx.args_info.output_obj.c_str());
 
   if (ctx.config.debug()) {
-    const auto path = prepare_debug_path(
-      ctx.config.debug_dir(), ctx.args_info.output_obj, "input-text");
+    const auto path = prepare_debug_path(ctx.config.debug_dir(),
+                                         ctx.time_of_invocation,
+                                         ctx.args_info.orig_output_obj,
+                                         "input-text");
     File debug_text_file(path, "w");
     if (debug_text_file) {
       ctx.hash_debug_files.push_back(std::move(debug_text_file));
@@ -2227,6 +2287,11 @@ do_cache_compilation(Context& ctx, const char* const* argv)
     MTR_SCOPE("hash", "common_hash");
     TRY(hash_common_info(
       ctx, processed.preprocessor_args, common_hash, ctx.args_info));
+  }
+
+  if (processed.hash_actual_cwd) {
+    common_hash.hash_delimiter("actual_cwd");
+    common_hash.hash(ctx.actual_cwd);
   }
 
   // Try to find the hash using the manifest.
@@ -2254,9 +2319,11 @@ do_cache_compilation(Context& ctx, const char* const* argv)
     std::tie(result_key, manifest_key) = *result_and_manifest_key;
     if (result_key) {
       // If we can return from cache at this point then do so.
-      const bool found =
+      const auto from_cache_result =
         from_cache(ctx, FromCacheCallMode::direct, *result_key);
-      if (found) {
+      if (!from_cache_result) {
+        return nonstd::make_unexpected(from_cache_result.error());
+      } else if (*from_cache_result) {
         return Statistic::direct_cache_hit;
       }
 
@@ -2321,8 +2388,11 @@ do_cache_compilation(Context& ctx, const char* const* argv)
     }
 
     // If we can return from cache at this point then do.
-    const auto found = from_cache(ctx, FromCacheCallMode::cpp, *result_key);
-    if (found) {
+    const auto from_cache_result =
+      from_cache(ctx, FromCacheCallMode::cpp, *result_key);
+    if (!from_cache_result) {
+      return nonstd::make_unexpected(from_cache_result.error());
+    } else if (*from_cache_result) {
       if (ctx.config.direct_mode() && manifest_key && put_result_in_manifest) {
         update_manifest_file(ctx, *manifest_key, *result_key);
       }
@@ -2367,11 +2437,9 @@ int
 ccache_main(int argc, const char* const* argv)
 {
   try {
-    // Check if we are being invoked as "ccache".
-    std::string program_name(Util::base_name(argv[0]));
-    if (Util::same_program_name(program_name, CCACHE_NAME)) {
+    if (Util::is_ccache_executable(argv[0])) {
       if (argc < 2) {
-        PRINT_RAW(stderr, core::get_usage_text());
+        PRINT_RAW(stderr, core::get_usage_text(Util::base_name(argv[0])));
         exit(EXIT_FAILURE);
       }
       // If the first argument isn't an option, then assume we are being

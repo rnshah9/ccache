@@ -44,6 +44,7 @@
 
 #include <fcntl.h>
 
+#include <algorithm>
 #include <optional>
 #include <string>
 
@@ -82,7 +83,7 @@ constexpr const char USAGE_TEXT[] =
   R"(Usage:
     {0} [options]
     {0} compiler [compiler options]
-    compiler [compiler options]          (via symbolic link)
+    compiler [compiler options]            (ccache masquerading as the compiler)
 
 Common options:
     -c, --cleanup              delete old files and recalculate size counters
@@ -113,7 +114,7 @@ Common options:
                                in human-readable format
     -s, --show-stats           show summary of configuration and statistics
                                counters in human-readable format (use
-                               -v/--verbose once of twice for more details)
+                               -v/--verbose once or twice for more details)
     -v, --verbose              increase verbosity
     -z, --zero-stats           zero statistics counters
 
@@ -121,8 +122,8 @@ Common options:
     -V, --version              print version and copyright information
 
 Options for secondary storage:
-        --trim-dir PATH        remove old files from directory _PATH_ until it
-                               is at most the size specified by --trim-max-size
+        --trim-dir PATH        remove old files from directory PATH until it is
+                               at most the size specified by --trim-max-size
                                (note: don't use this option to trim the primary
                                cache)
         --trim-max-size SIZE   specify the maximum size for --trim-dir;
@@ -282,16 +283,16 @@ trim_dir(const std::string& dir,
 }
 
 static std::string
-get_version_text()
+get_version_text(const std::string_view ccache_name)
 {
   return FMT(
-    VERSION_TEXT, CCACHE_NAME, CCACHE_VERSION, storage::get_features());
+    VERSION_TEXT, ccache_name, CCACHE_VERSION, storage::get_features());
 }
 
 std::string
-get_usage_text()
+get_usage_text(const std::string_view ccache_name)
 {
-  return FMT(USAGE_TEXT, CCACHE_NAME);
+  return FMT(USAGE_TEXT, ccache_name);
 }
 
 enum {
@@ -415,11 +416,16 @@ process_main_options(int argc, const char* const* argv)
     case CHECKSUM_FILE: {
       util::XXH3_128 checksum;
       Fd fd(arg == "-" ? STDIN_FILENO : open(arg.c_str(), O_RDONLY));
-      Util::read_fd(*fd, [&checksum](const void* data, size_t size) {
-        checksum.update(data, size);
-      });
-      const auto digest = checksum.digest();
-      PRINT(stdout, "{}\n", Util::format_base16(digest.bytes(), digest.size()));
+      if (fd) {
+        Util::read_fd(*fd, [&checksum](const void* data, size_t size) {
+          checksum.update(data, size);
+        });
+        const auto digest = checksum.digest();
+        PRINT(
+          stdout, "{}\n", Util::format_base16(digest.bytes(), digest.size()));
+      } else {
+        PRINT(stderr, "Error: Failed to checksum {}\n", arg);
+      }
       break;
     }
 
@@ -449,12 +455,14 @@ process_main_options(int argc, const char* const* argv)
 
     case HASH_FILE: {
       Hash hash;
-      if (arg == "-") {
-        hash.hash_fd(STDIN_FILENO);
+      const bool ok =
+        arg == "-" ? hash.hash_fd(STDIN_FILENO) : hash.hash_file(arg);
+      if (ok) {
+        PRINT(stdout, "{}\n", hash.digest().to_string());
       } else {
-        hash.hash_file(arg);
+        PRINT(stderr, "Error: Failed to hash {}\n", arg);
+        return EXIT_FAILURE;
       }
-      PRINT(stdout, "{}\n", hash.digest().to_string());
       break;
     }
 
@@ -492,14 +500,11 @@ process_main_options(int argc, const char* const* argv)
       if (isatty(STDOUT_FILENO)) {
         PRINT_RAW(stdout, "\n");
       }
-#ifdef INODE_CACHE_SUPPORTED
-      InodeCache(config).drop();
-#endif
       break;
     }
 
     case 'h': // --help
-      PRINT(stdout, USAGE_TEXT, CCACHE_NAME, CCACHE_NAME);
+      PRINT(stdout, USAGE_TEXT, Util::base_name(argv[0]));
       return EXIT_SUCCESS;
 
     case 'k': // --get-config
@@ -580,7 +585,7 @@ process_main_options(int argc, const char* const* argv)
       break;
 
     case 'V': // --version
-      PRINT_RAW(stdout, get_version_text());
+      PRINT_RAW(stdout, get_version_text(Util::base_name(argv[0])));
       break;
 
     case 'x': // --show-compression
@@ -618,7 +623,7 @@ process_main_options(int argc, const char* const* argv)
       break;
 
     default:
-      PRINT(stderr, USAGE_TEXT, CCACHE_NAME, CCACHE_NAME);
+      PRINT(stderr, USAGE_TEXT, Util::base_name(argv[0]));
       return EXIT_FAILURE;
     }
   }

@@ -21,8 +21,8 @@
 #include <Stat.hpp>
 #include <util/Tokenizer.hpp>
 
-#include <algorithm>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <ios>
 #include <memory>
@@ -32,7 +32,6 @@
 #include <utility>
 #include <vector>
 
-class Config;
 class Context;
 
 namespace Util {
@@ -80,14 +79,6 @@ big_endian_to_int(const uint8_t* buffer, uint8_t& value)
 // should start with a dot, no extra dot is inserted.
 std::string change_extension(std::string_view path, std::string_view new_ext);
 
-// Return `value` adjusted to not be less than `min` and not more than `max`.
-template<typename T>
-T
-clamp(T value, T min, T max)
-{
-  return std::min(max, std::max(min, value));
-}
-
 // Clone a file from `src` to `dest`. If `via_tmp_file` is true, `src` is cloned
 // to a temporary file and then renamed to `dest`. Throws `core::Error` on
 // error.
@@ -98,7 +89,7 @@ void clone_file(const std::string& src,
 // Clone, hard link or copy a file from `source` to `dest` depending on settings
 // in `ctx`. If cloning or hard linking cannot and should not be done the file
 // will be copied instead. Throws `core::Error` on error.
-void clone_hard_link_or_copy_file(const Config& config,
+void clone_hard_link_or_copy_file(const Context& ctx,
                                   const std::string& source,
                                   const std::string& dest,
                                   bool via_tmp_file = false);
@@ -185,17 +176,11 @@ const char* get_hostname();
 // resolve to the same file as `path`.
 std::string get_relative_path(std::string_view dir, std::string_view path);
 
-#ifndef _WIN32
 // Get process umask.
 mode_t get_umask();
-#endif
 
 // Hard-link `oldpath` to `newpath`. Throws `core::Error` on error.
 void hard_link(const std::string& oldpath, const std::string& newpath);
-
-// Hard-link `oldpath` to `newpath`, or fall back to copying if hard-linking
-// doesn't work. Throws `core::Error` on error.
-void hard_link_or_copy(const std::string& oldpath, const std::string& newpath);
 
 // Write bytes in big endian order from an integer value.
 //
@@ -230,6 +215,9 @@ int_to_big_endian(int8_t value, uint8_t* buffer)
 // point.
 std::optional<size_t> is_absolute_path_with_prefix(std::string_view path);
 
+// Detmine if `path` refers to a ccache executable.
+bool is_ccache_executable(std::string_view path);
+
 // Test if a file is on nfs.
 //
 // Sets is_nfs to the result if fstatfs is available and no error occurred.
@@ -257,6 +245,15 @@ bool is_precompiled_header(std::string_view path);
 // Thread-safe version of `localtime(3)`. If `time` is not specified the current
 // time of day is used.
 std::optional<tm> localtime(std::optional<time_t> time = {});
+
+// Construct a normalized native path, used like:
+// std::string path = Util::make_path("usr", "local", "bin");
+template<typename... T>
+std::string
+make_path(const T&... args)
+{
+  return (std::filesystem::path{} / ... / args).lexically_normal().string();
+}
 
 // Make a relative path from current working directory (either `actual_cwd` or
 // `apparent_cwd`) to `path` if `path` is under `base_dir`.
@@ -333,12 +330,6 @@ std::string_view remove_extension(std::string_view path);
 // error.
 void rename(const std::string& oldpath, const std::string& newpath);
 
-// Detmine if `program_name` is equal to `canonical_program_name`. On Windows,
-// this means performing a case insensitive equality check with and without a
-// ".exe" suffix. On non-Windows, it is a simple equality check.
-bool same_program_name(std::string_view program_name,
-                       std::string_view canonical_program_name);
-
 // Send `text` to file descriptor `fd`, optionally stripping ANSI color
 // sequences if `ctx.args_info.strip_diagnostics_colors` is true and rewriting
 // paths to absolute if `ctx.config.absolute_paths_in_stderr` is true. Throws
@@ -347,6 +338,9 @@ void send_to_fd(const Context& ctx, const std::string& text, int fd);
 
 // Set the FD_CLOEXEC on file descriptor `fd`. This is a NOP on Windows.
 void set_cloexec_flag(int fd);
+
+// Set process umask. Returns the previous mask.
+mode_t set_umask(mode_t mask);
 
 // Set environment variable `name` to `value`.
 void setenv(const std::string& name, const std::string& value);
@@ -407,9 +401,6 @@ bool unlink_tmp(const std::string& path,
 
 // Unset environment variable `name`.
 void unsetenv(const std::string& name);
-
-// Set mtime of `path` to the current timestamp.
-void update_mtime(const std::string& path);
 
 // Remove `path` (and its contents if it's a directory). A nonexistent path is
 // not considered an error.

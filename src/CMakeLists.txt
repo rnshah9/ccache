@@ -7,7 +7,6 @@ set(
   Depfile.cpp
   Fd.cpp
   Hash.cpp
-  Lockfile.cpp
   Logging.cpp
   ProgressBar.cpp
   Result.cpp
@@ -44,17 +43,14 @@ endif()
 add_library(ccache_framework STATIC ${source_files})
 
 if(WIN32)
-  target_link_libraries(ccache_framework PRIVATE "psapi")
+  list(APPEND CCACHE_EXTRA_LIBS psapi)
+endif()
 
-  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
-    if(STATIC_LINK)
-      target_link_libraries(ccache_framework PRIVATE -static-libgcc -static-libstdc++ -static winpthread -dynamic)
-    else()
-      target_link_libraries(ccache_framework PRIVATE winpthread)
-    endif()
-  elseif(STATIC_LINK AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    target_link_libraries(ccache_framework PRIVATE -static c++ -dynamic)
-  endif()
+if(CCACHE_EXTRA_LIBS)
+  target_link_libraries(
+    ccache_framework
+    PRIVATE "${CCACHE_EXTRA_LIBS}"
+  )
 endif()
 
 set(THREADS_PREFER_PTHREAD_FLAG ON)
@@ -64,15 +60,18 @@ target_link_libraries(
   PRIVATE standard_settings standard_warnings ZSTD::ZSTD Threads::Threads third_party
 )
 
-target_include_directories(ccache_framework PRIVATE ${CMAKE_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(ccache_framework PUBLIC ${CMAKE_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
 
 if(REDIS_STORAGE_BACKEND)
-  target_compile_definitions(ccache_framework PRIVATE -DHAVE_REDIS_STORAGE_BACKEND)
+  target_compile_definitions(ccache_framework PUBLIC -DHAVE_REDIS_STORAGE_BACKEND)
   target_link_libraries(
     ccache_framework
     PUBLIC standard_settings standard_warnings HIREDIS::HIREDIS third_party
   )
 endif()
+
+add_executable(test-lockfile test_lockfile.cpp)
+target_link_libraries(test-lockfile PRIVATE ccache_framework)
 
 add_subdirectory(compression)
 add_subdirectory(core)

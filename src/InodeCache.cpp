@@ -70,17 +70,13 @@ static_assert(std::is_trivially_copyable<Digest>::value,
               "Digest is expected to be trivially copyable.");
 
 static_assert(
-  static_cast<int>(InodeCache::ContentType::binary) == 0,
+  static_cast<int>(InodeCache::ContentType::raw) == 0,
   "Numeric value is part of key, increment version number if changed.");
 static_assert(
-  static_cast<int>(InodeCache::ContentType::code) == 1,
+  static_cast<int>(InodeCache::ContentType::checked_for_temporal_macros) == 1,
   "Numeric value is part of key, increment version number if changed.");
-static_assert(
-  static_cast<int>(InodeCache::ContentType::code_with_sloppy_time_macros) == 2,
-  "Numeric value is part of key, increment version number if changed.");
-static_assert(
-  static_cast<int>(InodeCache::ContentType::precompiled_header) == 3,
-  "Numeric value is part of key, increment version number if changed.");
+
+const void* MMAP_FAILED = reinterpret_cast<void*>(-1); // NOLINT: Must cast here
 
 } // namespace
 
@@ -90,18 +86,9 @@ struct InodeCache::Key
   dev_t st_dev;
   ino_t st_ino;
   mode_t st_mode;
-#ifdef HAVE_STRUCT_STAT_ST_MTIM
   timespec st_mtim;
-#else
-  time_t st_mtim;
-#endif
-#ifdef HAVE_STRUCT_STAT_ST_CTIM
   timespec st_ctim; // Included for sanity checking.
-#else
-  time_t st_ctim; // Included for sanity checking.
-#endif
-  off_t st_size; // Included for sanity checking.
-  bool sloppy_time_macros;
+  off_t st_size;    // Included for sanity checking.
 };
 
 struct InodeCache::Entry
@@ -148,7 +135,7 @@ InodeCache::mmap_file(const std::string& inode_cache_file)
   SharedRegion* sr = reinterpret_cast<SharedRegion*>(mmap(
     nullptr, sizeof(SharedRegion), PROT_READ | PROT_WRITE, MAP_SHARED, *fd, 0));
   fd.close();
-  if (sr == reinterpret_cast<void*>(-1)) {
+  if (sr == MMAP_FAILED) {
     LOG("Failed to mmap {}: {}", inode_cache_file, strerror(errno));
     return false;
   }
@@ -188,16 +175,8 @@ InodeCache::hash_inode(const std::string& path,
   key.st_dev = stat.device();
   key.st_ino = stat.inode();
   key.st_mode = stat.mode();
-#ifdef HAVE_STRUCT_STAT_ST_MTIM
   key.st_mtim = stat.mtim();
-#else
-  key.st_mtim = stat.mtime();
-#endif
-#ifdef HAVE_STRUCT_STAT_ST_CTIM
   key.st_ctim = stat.ctim();
-#else
-  key.st_ctim = stat.ctime();
-#endif
   key.st_size = stat.size();
 
   Hash hash;
@@ -280,7 +259,7 @@ InodeCache::create_new_file(const std::string& filename)
                                          MAP_SHARED,
                                          *tmp_file.fd,
                                          0));
-  if (sr == reinterpret_cast<void*>(-1)) {
+  if (sr == MMAP_FAILED) {
     LOG("Failed to mmap new inode cache: {}", strerror(errno));
     return false;
   }

@@ -24,6 +24,8 @@
 
 #include <core/exceptions.hpp>
 #include <core/wincompat.hpp>
+#include <fmtmacros.hpp>
+#include <util/file.hpp>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -35,9 +37,7 @@
 
 using Result::FileType;
 
-ResultRetriever::ResultRetriever(Context& ctx, bool rewrite_dependency_target)
-  : m_ctx(ctx),
-    m_rewrite_dependency_target(rewrite_dependency_target)
+ResultRetriever::ResultRetriever(Context& ctx) : m_ctx(ctx)
 {
 }
 
@@ -117,19 +117,18 @@ ResultRetriever::on_entry_start(uint8_t entry_number,
   } else if (dest_path == "/dev/null") {
     LOG_RAW("Not writing to /dev/null");
   } else if (raw_file) {
-    Util::clone_hard_link_or_copy_file(
-      m_ctx.config, *raw_file, dest_path, false);
+    Util::clone_hard_link_or_copy_file(m_ctx, *raw_file, dest_path, false);
 
     // Update modification timestamp to save the file from LRU cleanup (and, if
     // hard-linked, to make the object file newer than the source file).
-    Util::update_mtime(*raw_file);
+    util::set_timestamps(*raw_file);
   } else {
     LOG("Writing to {}", dest_path);
     m_dest_fd = Fd(
       open(dest_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0666));
     if (!m_dest_fd) {
-      throw core::Error(
-        "Failed to open {} for writing: {}", dest_path, strerror(errno));
+      throw WriteError(
+        FMT("Failed to open {} for writing: {}", dest_path, strerror(errno)));
     }
     m_dest_path = dest_path;
   }
@@ -150,7 +149,7 @@ ResultRetriever::on_entry_data(const uint8_t* data, size_t size)
     try {
       Util::write_fd(*m_dest_fd, data, size);
     } catch (core::Error& e) {
-      throw core::Error("Failed to write to {}: {}", m_dest_path, e.what());
+      throw WriteError(FMT("Failed to write to {}: {}", m_dest_path, e.what()));
     }
   }
 }
@@ -178,15 +177,17 @@ ResultRetriever::on_entry_end()
 void
 ResultRetriever::write_dependency_file()
 {
+  ASSERT(m_ctx.args_info.dependency_target);
+  const auto& dep_target = *m_ctx.args_info.dependency_target;
+
   try {
     size_t start_pos = 0;
-    if (m_rewrite_dependency_target) {
-      size_t colon_pos = m_dest_data.find(':');
-      if (colon_pos != std::string::npos) {
-        const auto escaped_output_obj =
-          Depfile::escape_filename(m_ctx.args_info.output_obj);
-        Util::write_fd(
-          *m_dest_fd, escaped_output_obj.data(), escaped_output_obj.length());
+    const size_t colon_pos = m_dest_data.find(": ");
+    if (colon_pos != std::string::npos) {
+      const auto obj_in_dep_file =
+        std::string_view(m_dest_data).substr(0, colon_pos);
+      if (obj_in_dep_file != dep_target) {
+        Util::write_fd(*m_dest_fd, dep_target.data(), dep_target.length());
         start_pos = colon_pos;
       }
     }
@@ -195,6 +196,6 @@ ResultRetriever::write_dependency_file()
                    m_dest_data.data() + start_pos,
                    m_dest_data.length() - start_pos);
   } catch (core::Error& e) {
-    throw core::Error("Failed to write to {}: {}", m_dest_path, e.what());
+    throw WriteError(FMT("Failed to write to {}: {}", m_dest_path, e.what()));
   }
 }

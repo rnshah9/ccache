@@ -54,6 +54,7 @@ const std::unordered_map<std::string /*scheme*/,
     {"http", std::make_shared<secondary::HttpStorage>()},
 #ifdef HAVE_REDIS_STORAGE_BACKEND
     {"redis", std::make_shared<secondary::RedisStorage>()},
+    {"redis+unix", std::make_shared<secondary::RedisStorage>()},
 #endif
 };
 
@@ -121,12 +122,15 @@ parse_storage_config(const std::string_view entry)
   }
 
   SecondaryStorageConfig result;
-  result.params.url = std::string(parts[0]);
-  // The Url class is parsing the URL object lazily; check if successful.
+  const auto url_str = std::string(parts[0]);
+  result.params.url = url_str;
+
+  // The Url class is parsing the URL object lazily. Check if the URL is valid
+  // now to avoid exceptions later.
   try {
-    std::ignore = result.params.url.host();
-  } catch (const Url::parse_error& e) {
-    throw core::Error("Cannot parse URL: {}", e.what());
+    std::ignore = result.params.url.str();
+  } catch (const std::exception& e) {
+    throw core::Error("Cannot parse URL {}: {}", url_str, e.what());
   }
 
   if (result.params.url.scheme().empty()) {
@@ -137,15 +141,13 @@ parse_storage_config(const std::string_view entry)
     if (parts[i].empty()) {
       continue;
     }
-    const auto kv_pair = util::split_once(parts[i], '=');
-    const auto& key = kv_pair.first;
-    const auto& raw_value = kv_pair.second.value_or("true");
+    const auto [key, right_hand_side] = util::split_once(parts[i], '=');
+    const auto& raw_value = right_hand_side.value_or("true");
     const auto value =
       util::value_or_throw<core::Error>(util::percent_decode(raw_value));
     if (key == "read-only") {
       result.read_only = (value == "true");
     } else if (key == "shards") {
-      const auto url_str = result.params.url.str();
       if (url_str.find('*') == std::string::npos) {
         throw core::Error(R"(Missing "*" in URL when using shards: "{}")",
                           url_str);
@@ -217,7 +219,6 @@ Storage::~Storage()
 void
 Storage::initialize()
 {
-  primary.initialize();
   add_secondary_storages();
 }
 
@@ -228,34 +229,42 @@ Storage::finalize()
 }
 
 std::optional<std::string>
-Storage::get(const Digest& key, const core::CacheEntryType type)
+Storage::get(const Digest& key,
+             const core::CacheEntryType type,
+             const Mode mode)
 {
   MTR_SCOPE("storage", "get");
 
-  auto path = primary.get(key, type);
-  primary.increment_statistic(path ? core::Statistic::primary_storage_hit
-                                   : core::Statistic::primary_storage_miss);
-  if (path) {
-    if (m_config.reshare()) {
-      // Temporary optimization until primary storage API has been refactored to
-      // pass data via memory instead of files.
-      const bool should_put_in_secondary_storage =
-        std::any_of(m_secondary_storages.begin(),
-                    m_secondary_storages.end(),
-                    [](const auto& entry) { return !entry->config.read_only; });
-      if (should_put_in_secondary_storage) {
-        std::string value;
-        try {
-          value = Util::read_file(*path);
-        } catch (const core::Error& e) {
-          LOG("Failed to read {}: {}", *path, e.what());
-          return path; // Don't indicate failure since primary storage was OK.
+  if (mode != Mode::secondary_only) {
+    auto path = primary.get(key, type);
+    primary.increment_statistic(path ? core::Statistic::primary_storage_hit
+                                     : core::Statistic::primary_storage_miss);
+    if (path) {
+      if (m_config.reshare()) {
+        // Temporary optimization until primary storage API has been refactored
+        // to pass data via memory instead of files.
+        const bool should_put_in_secondary_storage = std::any_of(
+          m_secondary_storages.begin(),
+          m_secondary_storages.end(),
+          [](const auto& entry) { return !entry->config.read_only; });
+        if (should_put_in_secondary_storage) {
+          std::string value;
+          try {
+            value = Util::read_file(*path);
+          } catch (const core::Error& e) {
+            LOG("Failed to read {}: {}", *path, e.what());
+            return path; // Don't indicate failure since primary storage was OK.
+          }
+          put_in_secondary_storage(key, value, true);
         }
-        put_in_secondary_storage(key, value, true);
       }
-    }
 
-    return path;
+      return path;
+    }
+  }
+
+  if (mode == Mode::primary_only) {
+    return std::nullopt;
   }
 
   const auto value_and_share_hits = get_from_secondary_storage(key);
@@ -349,13 +358,19 @@ Storage::get_secondary_storage_config_for_logging() const
   return util::join(configs, " ");
 }
 
+static void
+redact_url_for_logging(Url& url_for_logging)
+{
+  url_for_logging.user_info("");
+}
+
 void
 Storage::add_secondary_storages()
 {
   const auto configs = parse_storage_configs(m_config.secondary_storage());
   for (const auto& config : configs) {
     auto url_for_logging = config.params.url;
-    url_for_logging.user_info("");
+    redact_url_for_logging(url_for_logging);
     const auto storage = get_storage(config.params.url);
     if (!storage) {
       throw core::Error("unknown secondary storage URL: {}",
@@ -439,7 +454,7 @@ Storage::get_backend(SecondaryStorageEntry& entry,
 
   if (backend == entry.backends.end()) {
     auto shard_url_for_logging = shard_url;
-    shard_url_for_logging.user_info("");
+    redact_url_for_logging(shard_url_for_logging);
     entry.backends.push_back(
       {shard_url, shard_url_for_logging.str(), {}, false});
     auto shard_params = entry.config.params;

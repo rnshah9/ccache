@@ -46,28 +46,12 @@ extern "C" {
 
 #include <fcntl.h>
 
-#include <algorithm>
-#include <climits>
-#include <codecvt>
-#include <fstream>
-#include <locale>
-
-#ifndef HAVE_DIRENT_H
-#  include <filesystem>
-#endif
-
 #ifdef HAVE_PWD_H
 #  include <pwd.h>
 #endif
 
 #ifdef HAVE_SYS_TIME_H
 #  include <sys/time.h>
-#endif
-
-#ifdef HAVE_UTIME_H
-#  include <utime.h>
-#elif defined(HAVE_SYS_UTIME_H)
-#  include <sys/utime.h>
 #endif
 
 #ifdef HAVE_LINUX_FS_H
@@ -100,9 +84,22 @@ extern "C" {
 #  endif
 #endif
 
+#include <algorithm>
+#include <climits>
+#include <codecvt>
+#include <fstream>
+#include <locale>
+
 using IncludeDelimiter = util::Tokenizer::IncludeDelimiter;
 
 namespace {
+
+// Process umask, read and written by get_umask and set_umask.
+mode_t g_umask = [] {
+  const mode_t mask = umask(0);
+  umask(mask);
+  return mask;
+}();
 
 // Search for the first match of the following regular expression:
 //
@@ -293,14 +290,13 @@ clone_file(const std::string& src, const std::string& dest, bool via_tmp_file)
 }
 #endif // FILE_CLONING_SUPPORTED
 
-static void
-clone_hard_link_or_copy_file(const std::string& source,
+void
+clone_hard_link_or_copy_file(const Context& ctx,
+                             const std::string& source,
                              const std::string& dest,
-                             bool try_clone,
-                             bool try_hard_link,
                              bool via_tmp_file)
 {
-  if (try_clone) {
+  if (ctx.config.file_clone()) {
 #ifdef FILE_CLONING_SUPPORTED
     LOG("Cloning {} to {}", source, dest);
     try {
@@ -313,7 +309,7 @@ clone_hard_link_or_copy_file(const std::string& source,
     LOG("Not cloning {} to {} since it's unsupported", source, dest);
 #endif
   }
-  if (try_hard_link) {
+  if (ctx.config.hard_link()) {
     LOG("Hard linking {} to {}", source, dest);
     try {
       Util::hard_link(source, dest);
@@ -331,16 +327,6 @@ clone_hard_link_or_copy_file(const std::string& source,
 
   LOG("Copying {} to {}", source, dest);
   copy_file(source, dest, via_tmp_file);
-}
-
-void
-clone_hard_link_or_copy_file(const Config& config,
-                             const std::string& source,
-                             const std::string& dest,
-                             bool via_tmp_file)
-{
-  clone_hard_link_or_copy_file(
-    source, dest, config.file_clone(), config.hard_link(), via_tmp_file);
 }
 
 size_t
@@ -673,26 +659,28 @@ get_extension(std::string_view path)
 std::string
 get_home_directory()
 {
-  const char* p = getenv("HOME");
-  if (p) {
-    return p;
-  }
 #ifdef _WIN32
-  p = getenv("APPDATA");
-  if (p) {
+  if (const char* p = getenv("USERPROFILE")) {
     return p;
   }
-#endif
-#ifdef HAVE_GETPWUID
+  throw core::Fatal(
+    "The USERPROFILE environment variable must be set to your user profile "
+    "folder");
+#else
+  if (const char* p = getenv("HOME")) {
+    return p;
+  }
+#  ifdef HAVE_GETPWUID
   {
     struct passwd* pwd = getpwuid(getuid());
     if (pwd) {
       return pwd->pw_dir;
     }
   }
-#endif
+#  endif
   throw core::Fatal(
     "Could not determine home directory from $HOME or getpwuid(3)");
+#endif
 }
 
 const char*
@@ -755,20 +743,11 @@ get_relative_path(std::string_view dir, std::string_view path)
   return result.empty() ? "." : result;
 }
 
-#ifndef _WIN32
 mode_t
 get_umask()
 {
-  static bool mask_retrieved = false;
-  static mode_t mask;
-  if (!mask_retrieved) {
-    mask = umask(0);
-    umask(mask);
-    mask_retrieved = true;
-  }
-  return mask;
+  return g_umask;
 }
-#endif
 
 void
 hard_link(const std::string& oldpath, const std::string& newpath)
@@ -794,12 +773,6 @@ hard_link(const std::string& oldpath, const std::string& newpath)
 #endif
 }
 
-void
-hard_link_or_copy(const std::string& oldpath, const std::string& newpath)
-{
-  return clone_hard_link_or_copy_file(oldpath, newpath, false, true, false);
-}
-
 std::optional<size_t>
 is_absolute_path_with_prefix(std::string_view path)
 {
@@ -823,6 +796,16 @@ is_absolute_path_with_prefix(std::string_view path)
     return split_pos;
   }
   return std::nullopt;
+}
+
+bool
+is_ccache_executable(const std::string_view path)
+{
+  std::string name(Util::base_name(path));
+#ifdef _WIN32
+  name = Util::to_lowercase(name);
+#endif
+  return util::starts_with(name, "ccache");
 }
 
 #if defined(HAVE_LINUX_FS_H) || defined(HAVE_STRUCT_STATFS_F_FSTYPENAME)
@@ -1072,13 +1055,13 @@ parse_size(const std::string& value)
     switch (*p) {
     case 'T':
       result *= multiplier;
-    // Fallthrough.
+      [[fallthrough]];
     case 'G':
       result *= multiplier;
-    // Fallthrough.
+      [[fallthrough]];
     case 'M':
       result *= multiplier;
-    // Fallthrough.
+      [[fallthrough]];
     case 'K':
     case 'k':
       result *= multiplier;
@@ -1264,19 +1247,6 @@ rename(const std::string& oldpath, const std::string& newpath)
 #endif
 }
 
-bool
-same_program_name(std::string_view program_name,
-                  std::string_view canonical_program_name)
-{
-#ifdef _WIN32
-  std::string lowercase_program_name = Util::to_lowercase(program_name);
-  return lowercase_program_name == canonical_program_name
-         || lowercase_program_name == FMT("{}.exe", canonical_program_name);
-#else
-  return program_name == canonical_program_name;
-#endif
-}
-
 void
 send_to_fd(const Context& ctx, const std::string& text, int fd)
 {
@@ -1296,7 +1266,7 @@ send_to_fd(const Context& ctx, const std::string& text, int fd)
       modified_text = strip_ansi_csi_seqs(text);
       text_to_send = &modified_text;
     } catch (const core::Error&) {
-      // Fall through
+      // Ignore.
     }
   }
 
@@ -1323,6 +1293,13 @@ set_cloexec_flag(int fd)
 #else
   (void)fd;
 #endif
+}
+
+mode_t
+set_umask(mode_t mask)
+{
+  g_umask = mask;
+  return umask(mask);
 }
 
 void
@@ -1521,16 +1498,6 @@ unsetenv(const std::string& name)
   ::unsetenv(name.c_str());
 #else
   putenv(strdup(name.c_str())); // Leak to environment.
-#endif
-}
-
-void
-update_mtime(const std::string& path)
-{
-#ifdef HAVE_UTIMES
-  utimes(path.c_str(), nullptr);
-#else
-  utime(path.c_str(), nullptr);
 #endif
 }
 

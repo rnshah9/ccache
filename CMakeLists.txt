@@ -75,7 +75,8 @@ include(DefaultBuildType)
 #
 # Configuration
 #
-include(GNUInstallDirs)
+
+include(InstallDirs)
 include(GenerateConfigurationFile)
 include(GenerateVersionFile)
 
@@ -83,32 +84,42 @@ include(GenerateVersionFile)
 # Static link configuration
 #
 
-if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "GNU")
-  option(STATIC_LINK "Link statically with system libraries" ON)
+set(STATIC_LINK_DEFAULT OFF)
+if(WIN32)
+  set(STATIC_LINK_DEFAULT ON)
 endif()
 
-if(MSVC AND STATIC_LINK)
-  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+option(STATIC_LINK "Prefer linking libraries statically" ${STATIC_LINK_DEFAULT})
+
+if(STATIC_LINK)
+  list(INSERT CMAKE_FIND_LIBRARY_SUFFIXES 0 "${CMAKE_STATIC_LIBRARY_SUFFIX}")
+  set(CMAKE_LINK_SEARCH_START_STATIC ON)
+
+  # Link MSVC runtime statically.
+  if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  # Link MINGW runtime statically.
+  elseif(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL GNU)
+    list(APPEND CCACHE_EXTRA_LIBS -static-libgcc -static-libstdc++ -static -lwinpthread -dynamic)
+  # Link WIN32 clang libs statically.
+  elseif(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL Clang)
+    list(APPEND CCACHE_EXTRA_LIBS -Wl,-Bstatic -lc++ -lunwind -Wl,-Bdynamic)
+  endif()
 endif()
 
 #
 # Third party
 #
-set(HIREDIS_FROM_INTERNET_DEFAULT OFF)
-set(ZSTD_FROM_INTERNET_DEFAULT OFF)
+option(ZSTD_FROM_INTERNET
+  "Download and use libzstd from the Internet if not available" ON)
+option(HIREDIS_FROM_INTERNET
+  "Download and use libhiredis from the Internet if not available" ON)
 
-# Default to downloading deps for Visual Studio, unless using a package manager.
-if(MSVC AND NOT CMAKE_TOOLCHAIN_FILE MATCHES "vcpkg|conan")
-  set(HIREDIS_FROM_INTERNET_DEFAULT ON)
-  set(ZSTD_FROM_INTERNET_DEFAULT ON)
-endif()
-
-option(ZSTD_FROM_INTERNET "Download and use libzstd from the Internet" ${ZSTD_FROM_INTERNET_DEFAULT})
 find_package(zstd 1.1.2 MODULE REQUIRED)
 
 option(REDIS_STORAGE_BACKEND "Enable Redis secondary storage" ON)
+
 if(REDIS_STORAGE_BACKEND)
-  option(HIREDIS_FROM_INTERNET "Download and use libhiredis from the Internet" ${HIREDIS_FROM_INTERNET_DEFAULT})
   find_package(hiredis 0.13.3 MODULE REQUIRED)
 endif()
 

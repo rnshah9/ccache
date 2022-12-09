@@ -1,0 +1,6 @@
+project: ccache
+target: format-human-readable-size
+
+cmds:
+  - cmd: /fuzz_format_human_readable_size
+    libfuzzer: true
